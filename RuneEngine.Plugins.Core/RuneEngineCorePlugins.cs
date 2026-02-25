@@ -34,6 +34,7 @@ public sealed class RuneEngineCorePlugins : IRunePlugin
     {
         registry.Register(new CompareRune());
         registry.Register(new ConditionRune());
+        registry.Register(new BranchRune());
     }
 
     private static void AddPrimitiveRunes(IRuneRegistry registry)
