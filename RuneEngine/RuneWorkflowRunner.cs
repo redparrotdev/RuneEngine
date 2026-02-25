@@ -1,5 +1,6 @@
 ﻿using RuneEngine.Interfaces;
 using RuneEngine.Models;
+using RuneEngine.Signals;
 using System.Collections.Concurrent;
 
 namespace RuneEngine;
@@ -26,25 +27,9 @@ public class RuneWorkflowRunner
 
         foreach (var runeDefinition in GetRunesTopologicalOrder(workflow))
         {
-            var rune = _registry.Resolve(runeDefinition.Name);
+            var output = await ExecuteRune(runeDefinition, result, cancellationToken, initialData);
 
-            var inputs = ResolveInputs(runeDefinition, result);
-            if (initialData is not null)
-            {
-                inputs = inputs.Concat(initialData).ToDictionary();
-            }
-
-            var context = new RuneExecutionContext
-            {
-                RuneId = runeDefinition.Id,
-                Inputs = inputs,
-                Services = _serviceProvider,
-                CancellationToken = cancellationToken
-            };
-
-            var output = await rune.ExecuteAsync(context);
-
-            result[runeDefinition.Id] = output.Outputs.ToDictionary();
+            result[runeDefinition.Id] = output;
         }
 
         return result;
@@ -71,10 +56,80 @@ public class RuneWorkflowRunner
         var result = new RuneWorkflowExecutionResult();
         foreach (var (runeId, executionTask) in executionTasks)
         {
-            result[runeId] = executionTask.Result.Outputs.ToDictionary();
+            result[runeId] = executionTask.Result;
         }
 
         return result;
+    }
+
+    private async Task<RuneExecutionResult> RunRuneInParallel(
+        RuneDefinition runeDefinition
+        , ConcurrentDictionary<string, Task<RuneExecutionResult>> executionTasks
+        , CancellationToken cancellationToken
+        , IReadOnlyDictionary<string, object?>? initialData = null)
+    {
+        var requiredInputs = runeDefinition.Inputs.Values
+            .OfType<ConnectionBinding>()
+            .DistinctBy(c => c.RuneId);
+
+        foreach (var runeId in requiredInputs.Select(ri => ri.RuneId))
+        {
+            if (executionTasks.ContainsKey(runeId)) continue;
+
+            throw new InvalidOperationException(
+                $"Output from source rune with ID '{runeId}' not scheduled.");
+        }
+
+        var dependentRunesExecutionResultsTasksMap = requiredInputs
+            .ToDictionary(
+                c => c.RuneId
+                , c => executionTasks[c.RuneId]);
+
+        await Task.WhenAll(dependentRunesExecutionResultsTasksMap.Values);
+
+        var workflowLikeResult = new RuneWorkflowExecutionResult();
+
+        foreach (var (runeId, executionResultTask) in dependentRunesExecutionResultsTasksMap)
+        {
+            var executionResult = await executionResultTask;
+            workflowLikeResult[runeId] = executionResult;
+        }
+
+        return await ExecuteRune(runeDefinition, workflowLikeResult, cancellationToken, initialData);
+    }
+
+    private async ValueTask<RuneExecutionResult> ExecuteRune(
+        RuneDefinition runeDefinition
+        , RuneWorkflowExecutionResult results
+        , CancellationToken cancellationToken
+        , IReadOnlyDictionary<string, object?>? initialData = null)
+    {
+        var inputs = ResolveInputs(runeDefinition, results);
+        if (initialData is not null)
+        {
+            inputs = inputs.Concat(initialData).ToDictionary();
+        }
+
+        var signals = ResolveSignals(runeDefinition, results);
+
+        var context = new RuneExecutionContext
+        {
+            RuneId = runeDefinition.Id,
+            Inputs = inputs,
+            Signals = signals,
+            Services = _serviceProvider,
+            CancellationToken = cancellationToken
+        };
+
+        var rune = _registry.Resolve(runeDefinition.Name);
+
+        var beforeExecuteResult = await rune.BeforeExecuteAsync(context);
+        if (beforeExecuteResult is not null)
+        {
+            return beforeExecuteResult;
+        }
+
+        return await rune.ExecuteAsync(context);
     }
 
 #pragma warning disable S3776 // Cognitive Complexity of methods should not be too high
@@ -101,7 +156,7 @@ public class RuneWorkflowRunner
                             throw new InvalidOperationException(
                                 $"Output from source rune with ID '{connectionBinding.RuneId}' not found.");
                         }
-                        if (!sourceRuneOutput.TryGetValue(connectionBinding.OutputName, out var value))
+                        if (!sourceRuneOutput.Outputs.TryGetValue(connectionBinding.OutputName, out var value))
                         {
                             throw new InvalidOperationException(
                                 $"Output '{connectionBinding.OutputName}' from source rune with ID " +
@@ -143,6 +198,40 @@ public class RuneWorkflowRunner
         }
 
         return resolvedInputs;
+    }
+
+    private Dictionary<string, ISignal> ResolveSignals(
+        RuneDefinition runeDefinition
+        , RuneWorkflowExecutionResult results)
+    {
+        var runeDescription = _registry.Resolve(runeDefinition.Name).Description;
+
+        var resolvedSignals = new Dictionary<string, ISignal>(runeDescription.Inputs.Count);
+
+        foreach (var inputPortName in runeDescription.Inputs.Select(port => port.Name))
+        {
+            if (!runeDefinition.Inputs.TryGetValue(inputPortName, out var inputBinding))
+            {
+                continue;
+            }
+
+            if (inputBinding is ConnectionBinding connectionBinding)
+            {
+                if (!results.TryGetValue(connectionBinding.RuneId, out var runeExecutionResult))
+                {
+                    continue;
+                }
+
+                if (!runeExecutionResult.Signals.TryGetValue(connectionBinding.OutputName, out var signal))
+                {
+                    continue;
+                }
+
+                resolvedSignals[inputPortName] = signal;
+            }
+        }
+
+        return resolvedSignals;
     }
 
     private static List<RuneDefinition> GetRunesTopologicalOrder(RuneWorkflow workflow)
@@ -209,56 +298,4 @@ public class RuneWorkflowRunner
         return result;
     }
 #pragma warning restore S3776 // Cognitive Complexity of methods should not be too high
-
-    private async Task<RuneExecutionResult> RunRuneInParallel(
-        RuneDefinition runeDefinition
-        , ConcurrentDictionary<string, Task<RuneExecutionResult>> executionTasks
-        , CancellationToken cancellationToken
-        , IReadOnlyDictionary<string, object?>? initialData = null)
-    {
-        var rune = _registry.Resolve(runeDefinition.Name);
-
-        var requiredInputs = runeDefinition.Inputs.Values
-            .OfType<ConnectionBinding>()
-            .DistinctBy(c => c.RuneId);
-
-        foreach (var runeId in requiredInputs.Select(ri => ri.RuneId))
-        {
-            if (executionTasks.ContainsKey(runeId)) continue;
-
-            throw new InvalidOperationException(
-                $"Output from source rune with ID '{runeId}' not scheduled.");
-        }
-
-        var dependentRunesExecutionResultsTasksMap = requiredInputs
-            .ToDictionary(
-                c => c.RuneId
-                , c => executionTasks[c.RuneId]);
-
-        await Task.WhenAll(dependentRunesExecutionResultsTasksMap.Values);
-
-        var workflowLikeResult = new RuneWorkflowExecutionResult();
-
-        foreach (var (runeId, executionResultTask) in dependentRunesExecutionResultsTasksMap)
-        {
-            var executionResult = await executionResultTask;
-            workflowLikeResult[runeId] = executionResult.Outputs.ToDictionary();
-        }
-
-        var inputs = ResolveInputs(runeDefinition, workflowLikeResult);
-        if (initialData is not null)
-        {
-            inputs = inputs.Concat(initialData).ToDictionary();
-        }
-
-        var context = new RuneExecutionContext
-        {
-            RuneId = runeDefinition.Id,
-            Inputs = inputs,
-            Services = _serviceProvider,
-            CancellationToken = cancellationToken
-        };
-
-        return await rune.ExecuteAsync(context);
-    }
 }
