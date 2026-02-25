@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="RuneEngine.Plugins.Core/RuneEngine.Plugins.Core.csproj" Id="9c1cfdad-3210-49ef-b2b5-adc628eacb6b" />
+  <Project Path="RuneEngine.Sandbox/RuneEngine.Sandbox.csproj" Id="138f91a1-16e5-478b-80ef-268138b88edf" />
+  <Project Path="RuneEngine/RuneEngine.csproj" />
+</Solution>
